@@ -227,12 +227,14 @@ func fetchModel(c *gin.Context) {
 	}
 
 	var openaiModels, anthropicModels []string
+	// 上游在 /models 里声明的端点信息（模型名 -> 协议位）；为空表示该上游不提供。
+	var openaiDeclaredProtocols map[string]model.Protocol
 	var openaiErr, anthropicErr error
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		openaiModels, openaiErr = fetchOpenAIModels(httpClient, ctx, target, request.Key, modelsURL(target.BaseURL, target.OpenAIResponsePath))
+		openaiModels, openaiDeclaredProtocols, openaiErr = fetchOpenAIModels(httpClient, ctx, target, request.Key, modelsURL(target.BaseURL, target.OpenAIResponsePath))
 	}()
 	go func() {
 		defer wg.Done()
@@ -291,6 +293,9 @@ func fetchModel(c *gin.Context) {
 	// 先并入 OpenAI 再并入 Anthropic, 顺序写死而不用 map 遍历, 否则界面上的模型排列会随每次刷新变化。
 	protocolsByModel := make(map[string]model.Protocol, len(openaiModels)+len(anthropicModels))
 	order := make([]string, 0, len(openaiModels)+len(anthropicModels))
+	// 上游在 /models 里声明了 supported_endpoints 的模型: 协议位以声明为准, 另一侧探测不再补位;
+	// 否则会给「只支持 /messages」的模型也标上 chat 位, 客户端用 chat 形状调用时会被合法地转发到错端点并 400。
+	authoritative := make(map[string]bool, len(openaiModels))
 	for _, name := range openaiModels {
 		matched, err := matches(name)
 		if err != nil {
@@ -303,7 +308,14 @@ func fetchModel(c *gin.Context) {
 		if _, ok := protocolsByModel[name]; !ok {
 			order = append(order, name)
 		}
-		protocolsByModel[name] |= model.ProtocolOpenAIResponse
+		if declared, ok := openaiDeclaredProtocols[name]; ok && declared != 0 {
+			protocolsByModel[name] |= declared
+			authoritative[name] = true
+			continue
+		}
+		// 未声明端点: 该列表来自 OpenAI 兼容端点, 视为同时支持 chat 与 responses 两个家族位。
+		// (原实现只标 responses, 漏掉 chat 位, 会让 chat 请求被降级到 Anthropic 而失败。)
+		protocolsByModel[name] |= model.ProtocolOpenAIResponse | model.ProtocolOpenAIChatCompletion
 	}
 	for _, name := range anthropicModels {
 		matched, err := matches(name)
@@ -316,6 +328,9 @@ func fetchModel(c *gin.Context) {
 		}
 		if _, ok := protocolsByModel[name]; !ok {
 			order = append(order, name)
+		}
+		if authoritative[name] {
+			continue
 		}
 		protocolsByModel[name] |= model.ProtocolAnthropicMessage
 	}
@@ -341,11 +356,29 @@ func modelsURL(baseURL, protocolPath string) string {
 	return strings.TrimRight(baseURL, "/") + parent + "/models"
 }
 
+// endpointProtocols 把上游 /models 返回的 supported_endpoints 映射成协议位。
+// 例: ["/chat/completions","/responses"] -> 2|4; ["/v1/messages"] -> 8。
+// 用后缀匹配以兼容带不带 /v1 前缀两种写法; 不认识的端点忽略。
+func endpointProtocols(endpoints []string) model.Protocol {
+	var protocol model.Protocol
+	for _, endpoint := range endpoints {
+		switch {
+		case strings.HasSuffix(endpoint, "/chat/completions"):
+			protocol |= model.ProtocolOpenAIChatCompletion
+		case strings.HasSuffix(endpoint, "/responses"):
+			protocol |= model.ProtocolOpenAIResponse
+		case strings.HasSuffix(endpoint, "/messages"):
+			protocol |= model.ProtocolAnthropicMessage
+		}
+	}
+	return protocol
+}
+
 // refer: https://platform.openai.com/docs/api-reference/models/list
-func fetchOpenAIModels(httpClient *http.Client, ctx context.Context, target model.ChannelConfig, key, url string) ([]string, error) {
+func fetchOpenAIModels(httpClient *http.Client, ctx context.Context, target model.ChannelConfig, key, url string) ([]string, map[string]model.Protocol, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	for _, header := range target.CustomHeader {
@@ -356,18 +389,23 @@ func fetchOpenAIModels(httpClient *http.Client, ctx context.Context, target mode
 
 	response, err := httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	result, err := decodeModelList[model.OpenAIModelList](response)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	models := make([]string, 0, len(result.Data))
+	// 只有上游明确声明了端点时才填入, 供调用方区分「声明过」与「没声明」。
+	declared := make(map[string]model.Protocol)
 	for _, m := range result.Data {
 		models = append(models, m.ID)
+		if protocol := endpointProtocols(m.SupportedEndpoints); protocol != 0 {
+			declared[m.ID] = protocol
+		}
 	}
-	return models, nil
+	return models, declared, nil
 }
 
 // refer: https://platform.claude.com/docs

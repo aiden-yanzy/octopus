@@ -17,6 +17,9 @@ type OpenAIModel struct {
 	Object  string `json:"object"`
 	Created int    `json:"created"`
 	OwnedBy string `json:"owned_by"`
+	// 部分上游（如 CommandCode）会逐模型声明支持的端点，例如 ["/chat/completions","/responses"]
+	// 或 ["/messages"]；有它就能把协议位标准，而不是按家族一刀切。
+	SupportedEndpoints []string `json:"supported_endpoints,omitempty"`
 }
 
 type OpenAIModelList struct {
